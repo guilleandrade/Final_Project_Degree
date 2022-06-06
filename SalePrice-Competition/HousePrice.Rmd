@@ -1,0 +1,223 @@
+---
+title: 'House Prices: Advanced Regression Techniques'
+author: "Guillermo Andrade Soriano"
+date: "19 de enero de 2018"
+output: word_document
+---
+
+Cargamos en primer lugar los paquetes necesarios.
+
+```{r warning=FALSE}
+library(ggplot2)
+library(plyr)
+library(dplyr)
+library(caret)
+library(moments)
+library(glmnet)
+library(elasticnet)
+library(knitr)
+```
+
+Cargamos el conjunto entrenamiento y el conjunto test.
+
+```{r}
+train <- read.csv("train.csv",stringsAsFactors = FALSE)
+test <- read.csv("test.csv",stringsAsFactors = FALSE)
+```
+
+Visualizamos algunas de las variables.
+
+```{r}
+ggplot ( data = train) +      
+  geom_point ( mapping = aes ( x =LotArea, y = SalePrice, colour=OverallQual))
+
+ggplot ( data = train) +      
+  geom_point ( mapping = aes ( x =LotArea, y = SalePrice)) +      
+  facet_wrap (~RoofStyle) 
+
+ggplot ( data = train) +      
+  geom_point ( mapping = aes ( x =Neighborhood, y = SalePrice, colour=OverallQual))
+
+ggplot ( data = train) +      
+  stat_summary ( mapping = aes ( x = Neighborhood, y = SalePrice), fun.ymin = min, fun.ymax = max, fun.y = median ) 
+```
+
+Comenzamos el preprocesamiento de datos.
+
+```{r}
+# combinamos train y test, sin la variable predictora Saleprice
+datos_completos <- rbind(select(train,MSSubClass:SaleCondition),
+                  select(test,MSSubClass:SaleCondition))
+
+# MSSUbClass nos sale numérica y en realidad es de tipo caracter, la cambiamos
+datos_completos$MSSubClass<-as.character(datos_completos$MSSubClass)
+
+# Datos de SalePrice y log(SalePrice + 1) para representarlos
+df <- rbind(data.frame(version="log(price+1)",x=log(train$SalePrice + 1)),
+            data.frame(version="price",x=train$SalePrice))
+# histograma
+ggplot(data=df) +
+  facet_wrap(~version,ncol=2,scales="free_x") +
+  geom_histogram(aes(x=x))
+```
+
+Observamos que la transformación logarítmica le da simetría a la variable Saleprice, por lo que la transformamos.
+
+```{r}
+train$SalePrice <- log(train$SalePrice + 1)
+```
+
+Con las variables dependientes procedemos de la siguiente manera:  
+- Para variables numéricas con mucha asimetría, le aplicamos la transformación logarítmica. Las demás variables numéricas no las modificamos.  
+- Las variables categóricas las convertimos en dummies.
+
+```{r}
+variable_clases <- sapply(names(datos_completos),function(x){class(datos_completos[[x]])})
+variable_numericas <-names(variable_clases[variable_clases != "character"])
+
+asimetria_variable <- sapply(variable_numericas,function(x){skewness(datos_completos[[x]],na.rm=TRUE)})
+
+# vamos a transformar las que tienen asimetria mayor a 0.75
+asimetria_variable <- asimetria_variable[asimetria_variable > 0.75]
+
+for(x in names(asimetria_variable)) {
+  datos_completos[[x]] <- log(datos_completos[[x]] + 1)
+}
+
+
+variable_categoricas <- names(variable_clases[variable_clases == "character"])
+dummies <- dummyVars(~.,datos_completos[variable_categoricas])
+variable_dummies <- predict(dummies,datos_completos[variable_categoricas])
+```
+
+Para los valores perdidos, procedemos de la siguiente manera:  
+- Para valores perdidos en variables numéricas, imputamos con la media de la variable.  
+- Para variables categóricas, como las hemos transformado en dummies, nos vale con rellenar los valores perdidos con 0s.
+
+```{r}
+variable_dummies[is.na(variable_dummies)] <- 0 
+
+for (x in variable_numericas) {
+  valor_medio <- mean(train[[x]],na.rm = TRUE)
+  datos_completos[[x]][is.na(datos_completos[[x]])] <- valor_medio
+}
+```
+
+Reconstruimos nuestro conjunto entrenamiento y conjunto test. Ahora tenemos 303 variables.
+
+```{r}
+# reconstruimos nuestra matriz de datos
+datos_completos <- cbind(datos_completos[variable_numericas],variable_dummies)
+
+# creamos train y test
+X_train <- datos_completos[1:nrow(train),]
+X_test <- datos_completos[(nrow(train)+1):nrow(datos_completos),]
+y <- train$SalePrice
+```
+
+Modelo.  
+Vamos a trabajar primero con la regresión lineal Ridge.
+
+```{r}
+CARET.TRAIN.CTRL <- trainControl(method="repeatedcv",
+                                 number=5,
+                                 repeats=5,
+                                 verboseIter=FALSE)
+lambdas <- seq(1,0,-0.001)
+
+set.seed(123)  
+model_ridge <- train(x=X_train,y=y,
+                     method="glmnet",
+                     metric="RMSE",
+                     maximize=FALSE,
+                     trControl=CARET.TRAIN.CTRL,
+                     tuneGrid=expand.grid(alpha=0,
+                                          lambda=lambdas))
+
+ggplot(data=filter(model_ridge$result,RMSE<0.14)) +
+  geom_line(aes(x=lambda,y=RMSE))
+
+mean(model_ridge$resample$RMSE)
+```
+
+En segundo lugar probamos con el modelo de regresión Lasso, que nos da un error cuadrático medio algo más bajo.
+
+```{r}
+set.seed(123) 
+model_lasso <- train(x=X_train,y=y,
+                     method="glmnet",
+                     metric="RMSE",
+                     maximize=FALSE,
+                     trControl=CARET.TRAIN.CTRL,
+                     tuneGrid=expand.grid(alpha=1,  
+                                          lambda=c(1,0.1,0.05,0.01,seq(0.009,0.001,-0.001),
+                                                   0.00075,0.0005,0.0001)))
+model_lasso
+
+
+mean(model_lasso$resample$RMSE)
+
+
+```
+
+Sobre este último modelo, vamos a ver el número de variables escogidas y representar los 10 coeficientes más altos y los 10 más bajos.
+
+```{r}
+coef <- data.frame(coef.name = dimnames(coef(model_lasso$finalModel,s=model_lasso$bestTune$lambda))[[1]], 
+                   coef.value = matrix(coef(model_lasso$finalModel,s=model_lasso$bestTune$lambda)))
+
+coef <- coef[-1,]
+
+variable_escogidas <- nrow(filter(coef,coef.value!=0))
+variable_Noescogidas <- nrow(filter(coef,coef.value==0))
+
+cat("Lasso escogió",variable_escogidas,"variables y eliminó las otras",
+    variable_Noescogidas,"variables\n")
+
+coef <- arrange(coef,-coef.value)
+
+imp_coef <- rbind(head(coef,10),
+                  tail(coef,10))
+
+ggplot(imp_coef) +
+  geom_bar(aes(x=reorder(coef.name,coef.value),y=coef.value),
+           stat="identity") +
+  ylim(-1.5,0.6) +
+  coord_flip() +
+  ggtitle("Coeficientes en el Modelo Lasso") +
+  theme(axis.title=element_blank())
+```
+
+Por último, realizamos las predicciones en el conjunto test.
+
+```{r}
+preds <- exp(predict(model_lasso,newdata=X_test)) - 1
+
+solucion <- data.frame(Id=as.integer(rownames(X_test)),SalePrice=preds)
+#write.csv(solucion,"ridge_sol.csv",row.names=FALSE)
+```
+
+
+
+Explicación teórica de los modelos.
+
+A partir de una muestra de entrenamiento, $${(y_i,x_{ij}): i=1,..,n ; j=1,..,p} $$, se plantea el modelo en términos matriciales: $$ Y = X\beta + \epsilon$$
+
+En el modelo de regresión Ridge, el estimador plantea el siguiente problema de optimización con restricciones: $$ min_\beta ( \sum_{i=1}^n (y_i - \sum_{j=1}^p \beta_jX_{ij})^2) $$ sujeto a $$ \sum_{j=1}^p \beta_{j}^2 \leq s$$ siendo $s \geq 0$ un parámetro de penalización por complejidad.
+
+En el modelo de regresión Lasso, se resuelve el mismo problema de mínimos cuadrados pero con distinta restricción sobre la nroma del vector de coeficientes: $$min_\beta ( \sum_{i=1}^n (y_i - \sum_{j=1}^p \beta_jX_{ij})^2) $$ sujeto a $$ \sum_{j=1}^p |\beta_{j}| \leq s$$
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

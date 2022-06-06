@@ -1,0 +1,288 @@
+---
+title: "Titanic"
+author: "Guillermo Andrade Soriano"
+date: "19 de enero de 2018"
+output: word_document
+---
+
+Cargamos en primer lugar los paquetes necesarios.
+
+```{r warning=FALSE}
+library('ggplot2') # visualización
+library('ggthemes') # visualización
+library('scales') # visualización
+library('dplyr') # Manipulación de datos
+library('mice') # imputación
+library('randomForest') # Algoritmo de clasificación
+```
+
+Cargamos el conjunto entrenamiento y el conjunto test.
+
+```{r}
+train <- read.csv('train.csv', stringsAsFactors = F)
+test  <- read.csv('test.csv', stringsAsFactors = F)
+```
+
+Juntamos en una misma variable el conjunto entrenamiento y el conjunto test.
+
+```{r}
+full  <- bind_rows(train, test) 
+```
+
+Comenzamos el preprocesamiento de datos. En la variable nombre, queremos extraer el título: Mr, Mrs o Miss.
+
+```{r}
+full$Title <- gsub('(.*, )|(\\..*)', '', full$Name)
+table(full$Sex, full$Title)
+rare_title <- c('Dona', 'Lady', 'the Countess','Capt', 'Col', 'Don', 
+                'Dr', 'Major', 'Rev', 'Sir', 'Jonkheer')
+full$Title[full$Title == 'Mlle']        <- 'Miss' 
+full$Title[full$Title == 'Ms']          <- 'Miss'
+full$Title[full$Title == 'Mme']         <- 'Mrs' 
+full$Title[full$Title %in% rare_title]  <- 'Rare Title'
+
+# Títulos distribuidos por sexo
+table(full$Sex, full$Title) 
+```
+
+Visualizamos la variable título con la variable supervivencia. Vemos la clara diferencia de ahogados respecto a salvados en Mr, y sin embargo Mrs y Miss se salvaron muchas más personas que ahogaron.
+
+```{r}
+ggplot(full[1:891,], aes(x = Title, fill = factor(Survived))) +
+  geom_bar(stat='count', position='dodge') +
+  theme_few()
+```
+
+De la variable nombre extraemos ahora el apellido de los pasajeros.
+
+```{r}
+full$Surname <- sapply(full$Name,  
+                       function(x) strsplit(x, split = '[,.]')[[1]][1])
+```
+
+Queremos comprobar si las familias se ahogaron o sobrevivieron juntas.
+
+```{r}
+full$Fsize <- full$SibSp + full$Parch + 1 #variable tamaño de la familia
+full$Family <- paste(full$Surname, full$Fsize, sep='_') # variable familia 
+
+# Visualizamos tamaño de la familia con supervivencia
+ggplot(full[1:891,], aes(x = Fsize, fill = factor(Survived))) +
+  geom_bar(stat='count', position='dodge') +
+  scale_x_continuous(breaks=c(1:11)) +
+  labs(x = 'Family Size') +
+  theme_few()
+```
+
+Vemos que familias pequeñas (2,3 y 4 miembros) sobrevivieron más que ahogaron. Por el contrario, familias de más de 4 miembros se ahogaron más que sobrevivieron.  
+Discretizamos la variable familia.
+
+```{r}
+full$FsizeD[full$Fsize == 1] <- 'singleton'
+full$FsizeD[full$Fsize < 5 & full$Fsize > 1] <- 'small'
+full$FsizeD[full$Fsize > 4] <- 'large'
+```
+
+La variable cabina tiene muchos valores perdidos, por lo que no vamos a trabajar con ella.
+
+```{r}
+full$Cabin[1:28]
+```
+
+Iniciamos la imputación de datos en las variables embarque, precio y edad.
+
+Los pasajeros 62 y 830 son los que tienen valor perdido en embarque.
+
+```{r}
+full[c(62, 830), 'Embarked']
+embark_fare <- full %>%
+  filter(PassengerId != 62 & PassengerId != 830)
+```
+
+Visualizamos las variables embarque con clase, con el fin de ver dónde se ajusta mejor el embarque de los dos valores perdidos.
+
+```{r}
+ggplot(embark_fare, aes(x = Embarked, y = Fare, fill = factor(Pclass))) +
+  geom_boxplot() +
+  geom_hline(aes(yintercept=80), 
+             colour='red', linetype='dashed', lwd=2) +
+  scale_y_continuous(labels=dollar_format()) +
+  theme_few()
+```
+
+La mediana del embarque C y clase 1 está muy cerca de 80$, por lo que vamos a asignarle la clase C a ambos.
+
+```{r}
+full$Embarked[c(62, 830)] <- 'C'
+```
+
+Tenemos un valor perdido en la variable precio del ticket (fare), en el pasajero 1044. Su clase es 3 y el embarque S.
+
+```{r}
+full[1044, ]
+
+ggplot(full[full$Pclass == '3' & full$Embarked == 'S', ], 
+       aes(x = Fare)) +
+  geom_density(fill = '#99d6ff', alpha=0.4) + 
+  geom_vline(aes(xintercept=median(Fare, na.rm=T)),
+             colour='red', linetype='dashed', lwd=1) +
+  scale_x_continuous(labels=dollar_format()) +
+  theme_few()
+```
+
+Reemplazamos el valor perdido con la mediana para fare en clase 3 y embarque S.
+
+```{r}
+full$Fare[1044] <- median(full[full$Pclass == '3' & full$Embarked == 'S', ]$Fare, na.rm = TRUE)
+```
+
+En la variable edad tenemos 263 valores perdidos. Vamos a utilizar la imputación "mice".
+
+```{r}
+# Convertimos estas variables en factor
+factor_vars <- c('PassengerId','Pclass','Sex','Embarked',
+                 'Title','Surname','Family','FsizeD')
+full[factor_vars] <- lapply(full[factor_vars], function(x) as.factor(x))
+
+set.seed(129) #Semilla aleatoria
+
+#Imputación mice, quitando las variables que no nos resultan útiles
+mice_mod <- mice(full[, !names(full) %in% c('PassengerId','Name','Ticket','Cabin','Family','Surname','Survived')], method='rf') 
+
+#Datos con la variable edad imputada
+mice_output <- complete(mice_mod)
+
+```
+
+Comparamos la distribución de la variable Age original y con los valores imputados, las cuales parecen similares.
+
+```{r}
+par(mfrow=c(1,2))
+hist(full$Age, freq=F, main='Age: Original Data', 
+     col='darkgreen', ylim=c(0,0.04))
+hist(mice_output$Age, freq=F, main='Age: MICE Output', 
+     col='lightgreen', ylim=c(0,0.04))
+par(mfrow=c(1,1))
+
+full$Age <- mice_output$Age
+```
+
+Ya no tenemos más valores perdidos. Ya hemos trabajado con todas las variables útiles, por lo que procedemos a crear el modelo.  
+Vamos a usar el algoritmo de clasificación RandomForest. Representamos el error del modelo y calculamos el porcentaje de acierto en nuestro conjunto entrenamiento.
+
+```{r}
+# Dividimos en conjunto entrenamiento y test
+train <- full[1:891,]
+test <- full[892:1309,]
+
+rf_model <- randomForest(factor(Survived) ~ Pclass + Sex + Age + SibSp + Parch + 
+                           Fare + Embarked + Title + FsizeD, data = train)
+# Error del modelo
+plot(rf_model, ylim=c(0,0.36))
+legend('topright', colnames(rf_model$err.rate), col=1:3, fill=1:3)
+#Porcentaje de acierto conjunto entrenamiento
+predictrain<- predict(rf_model,train)
+aciertos<-table(valorReal=train$Survived,predictrain)
+aciertos
+(aciertos[1,1]+aciertos[2,2])/sum(aciertos)*100
+```
+
+Vamos a representar ahora las variables más influyentes en nuestro modelo.
+
+```{r}
+importance    <- importance(rf_model)
+varImportance <- data.frame(Variables = row.names(importance), 
+                            Importance = round(importance[ ,'MeanDecreaseGini'],2))
+
+rankImportance <- varImportance %>%
+  mutate(Rank = paste0('#',dense_rank(desc(Importance))))
+
+# Visualizamos la importancia de las variables
+ggplot(rankImportance, aes(x = reorder(Variables, Importance), 
+                           y = Importance, fill = Importance)) +
+  geom_bar(stat='identity') + 
+  geom_text(aes(x = Variables, y = 0.5, label = Rank),
+            hjust=0, vjust=0.55, size = 4, colour = 'red') +
+  labs(x = 'Variables') +
+  coord_flip() + 
+  theme_few()
+```
+
+Vemos que la variable título es la que más influye en el modelo.
+
+Procedemos por último a hacer nuestra predicción en el conjunto test.
+
+```{r}
+prediccion <- predict(rf_model, test)
+solucion <- data.frame(PassengerID = test$PassengerId, Survived = prediccion)
+
+#write.csv(solucion, file = 'rf_mod_Solucion.csv', row.names = F)
+```
+
+
+
+¿Qué es un random forest?
+
+Random forest es un método que combina una cantidad grande de árboles de decisión independientes probados sobre conjuntos de datos aleatorios con igual distribución.
+
+¿Cómo se construye un random forest?
+
+La fase de aprendizaje consiste en crear muchos árboles de decisión independientes, construyéndolos a partir de datos de entrada ligeramente distintos. Se altera, por tanto, el conjunto inicial de partida, haciendo lo siguiente:
+
+- Se selecciona aleatoriamente con reemplazamiento un porcentaje de datos de la muestra total.
+
+Es habitual incluir un segundo nivel aleatoriedad, esta vez afectando los atributos:
+
+- En cada nodo, al seleccionar la partición óptima, tenemos en cuenta sólo una porción de los atributos, elegidos al azar en cada ocasión.
+
+Una vez que tenemos muchos árboles, 1000 por ejemplo, la fase de clasificación se lleva a cabo de la siguiente forma:
+
+- Cada árbol se evalúa de forma independiente y la predicción del bosque será la media de los 1000 árboles. La proporción de árboles que toman una misma respuesta se interpreta como la probabilidad de la misma.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
